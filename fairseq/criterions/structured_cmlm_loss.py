@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 from fairseq.criterions import FairseqCriterion, register_criterion
@@ -101,13 +102,30 @@ class StructuredCMLMLoss(FairseqCriterion):
         loss_nll = log_Z - path_score
         
         # Sum batch losses (or average if specified)
-        loss = loss_nll.sum() if reduce else loss_nll
+        crf_loss = loss_nll.sum() if reduce else loss_nll
+
+        # Length Loss Calculation
+        try:
+            length_logits = net_output['encoder_out']['predicted_lengths']
+            targets_length = targets.ne(self.padding_idx).sum(dim=1)
+            length_loss = F.cross_entropy(
+                length_logits,
+                targets_length,
+                reduction='sum' if reduce else 'none'
+            )
+        except Exception as e:
+            doc_id = sample.get('id', 'Unknown')
+            raise RuntimeError(f"Length Loss error. Doc ID: {doc_id}. Error: {str(e)}")
+            
+        loss = crf_loss + length_loss
 
         # Return the dictionary format required by Fairseq
         sample_size = sample['target'].size(0) if self.args.sentence_avg else sample['ntokens']
         
         logging_output = {
             'loss': loss.data,
+            'crf_loss': crf_loss.data,
+            'length_loss': length_loss.data,
             'ntokens': sample['ntokens'],
             'nsentences': sample['target'].size(0),
             'sample_size': sample_size,
@@ -119,11 +137,15 @@ class StructuredCMLMLoss(FairseqCriterion):
     def aggregate_logging_outputs(logging_outputs):
         """Aggregate logging outputs from data parallel training."""
         loss_sum = sum(log.get('loss', 0) for log in logging_outputs)
+        crf_loss_sum = sum(log.get('crf_loss', 0) for log in logging_outputs)
+        length_loss_sum = sum(log.get('length_loss', 0) for log in logging_outputs)
         ntokens = sum(log.get('ntokens', 0) for log in logging_outputs)
         sample_size = sum(log.get('sample_size', 0) for log in logging_outputs)
         
         agg_output = {
             'loss': loss_sum / sample_size / math.log(2) if sample_size > 0 else 0.,
+            'crf_loss': crf_loss_sum / sample_size / math.log(2) if sample_size > 0 else 0.,
+            'length_loss': length_loss_sum / sample_size / math.log(2) if sample_size > 0 else 0.,
             'ntokens': ntokens,
             'nsentences': sum(log.get('nsentences', 0) for log in logging_outputs),
             'sample_size': sample_size,
