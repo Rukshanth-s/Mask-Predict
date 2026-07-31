@@ -22,8 +22,12 @@ from fairseq import options
 from fairseq import utils
 
 from fairseq.modules import (
-    AdaptiveSoftmax, CharacterTokenEmbedder, MultiheadAttention,
+    AdaptiveSoftmax, BertLayerNorm, CharacterTokenEmbedder, MultiheadAttention,
     SimpleSinusoidalPositionalEmbedding, LearnedPositionalEmbedding
+)
+from fairseq.modules.dynamic_crf_output_layer import CRF_INFERENCE_CHOICES
+from fairseq.modules.output_layer import (
+    EMISSION_LAYER_CHOICES, OUTPUT_LAYER_CHOICES, build_output_layer,
 )
 
 def gelu(x):
@@ -33,26 +37,23 @@ def gelu(x):
     """
     return x * 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
 
+def _arg_or_default(args, name, default):
+    """Resolve an optional argument to its default.
+
+    An unset argument is normally *absent* from the namespace (fairseq parses
+    model args with ``argument_default=argparse.SUPPRESS``), and checkpoints
+    predating the argument have no attribute either -- but a plain parser leaves
+    it at ``None``. All three mean "use the default".
+    """
+    value = getattr(args, name, None)
+    return default if value is None else value
+
+
 def PositionalEmbedding(num_embeddings, embedding_dim, padding_idx):
     m = LearnedPositionalEmbedding(num_embeddings + padding_idx + 1, embedding_dim, padding_idx)
     nn.init.normal_(m.weight, mean=0, std=0.02)
     nn.init.constant_(m.weight[padding_idx], 0)
     return m
-
-class BertLayerNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-12):
-        """Construct a layernorm module in the TF style (epsilon inside the square root).
-        """
-        super(BertLayerNorm, self).__init__()
-        self.gamma = nn.Parameter(torch.ones(hidden_size))
-        self.beta = nn.Parameter(torch.zeros(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, x):
-        u = x.mean(-1, keepdim=True)
-        s = (x - u).pow(2).mean(-1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.variance_epsilon)
-        return self.gamma * x + self.beta
 
 @register_model('bert_transformer_seq2seq')
 class Transformer_nonautoregressive(FairseqModel):
@@ -73,6 +74,37 @@ class Transformer_nonautoregressive(FairseqModel):
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
     
+    @staticmethod
+    def reference_tokens(prev_output_tokens, target, padding_idx):
+        """Recover the complete reference sequence from a CMLM training pair.
+
+        The dataset (fairseq/data/language_pair_self_dataset_mask.py) hands the
+        criterion a ``target`` that is padding everywhere except the positions the
+        model was asked to predict, while ``prev_output_tokens`` holds the
+        reference at every *other* position and <mask> at the predicted ones.
+        A per-token loss only needs the former, but a structured loss scores the
+        whole sequence, so the two have to be recombined.
+        """
+        return torch.where(target.ne(padding_idx), target, prev_output_tokens)
+
+    def get_structured_loss(self, net_output, sample):
+        """Sequence-level loss of the output layer, or None if it has none.
+
+        Returns one value per sentence.
+        """
+        output_layer = net_output[1].get('output_layer', None)
+        if output_layer is None or not hasattr(output_layer, 'crf_nll'):
+            return None
+
+        padding_idx = self.decoder.padding_idx
+        prev_output_tokens = sample['net_input']['prev_output_tokens']
+        reference = self.reference_tokens(
+            prev_output_tokens, sample['target'], padding_idx)
+        # The chain spans the whole sequence, not just the masked positions, so
+        # the mask comes from the decoder input rather than from the target.
+        return output_layer.crf_nll(
+            net_output[1]['features'], reference, net_output[1]['output_mask'])
+
     @staticmethod
     def add_args(parser):
         """Add model-specific arguments to the parser."""
@@ -140,6 +172,35 @@ class Transformer_nonautoregressive(FairseqModel):
                             help='scaling factor for embeddings used in decoder')
         parser.add_argument('--encoder-embed-scale', type=float,
                             help='scaling factor for embeddings used in encoder')
+        parser.add_argument('--decoder-output-layer',
+                            choices=OUTPUT_LAYER_CHOICES,
+                            help='which head maps decoder states onto the vocabulary: '
+                                 'a lookup against the (shared) token embeddings, a dedicated '
+                                 'trained MLP, or a structured CRF layer (arXiv:1910.11555)')
+        parser.add_argument('--decoder-output-mlp-hidden-dim', type=int, metavar='N',
+                            help='hidden dimension of the MLP output head '
+                                 '(default: decoder output dimension)')
+        parser.add_argument('--crf-emission-layer',
+                            choices=EMISSION_LAYER_CHOICES,
+                            help='head producing the CRF emission (label) scores')
+        parser.add_argument('--crf-low-rank-dim', type=int, metavar='N',
+                            help='dimension d_t of the CRF transition embeddings E1/E2')
+        parser.add_argument('--crf-beam-size', type=int, metavar='N',
+                            help='number of candidates k kept per position by the CRF beam '
+                                 'approximation')
+        parser.add_argument('--crf-no-dynamic-transition', default=False, action='store_true',
+                            help='use a static transition matrix E1 E2^T instead of one '
+                                 'conditioned on the adjacent decoder states')
+        parser.add_argument('--crf-dynamic-hidden-dim', type=int, metavar='N',
+                            help='hidden dimension of the FFN producing the dynamic transition '
+                                 '(default: decoder output dimension)')
+        parser.add_argument('--crf-nar-loss-weight', type=float, metavar='D',
+                            help='weight lambda of the per-token non-autoregressive loss added '
+                                 'to the CRF loss')
+        parser.add_argument('--crf-inference',
+                            choices=CRF_INFERENCE_CHOICES,
+                            help='how the CRF produces output tokens and their per-position '
+                                 'confidence at generation time')
 
     @classmethod
     def build_model(cls, args, task):
@@ -274,8 +335,16 @@ class SelfTransformerDecoder(FairseqIncrementalDecoder):
 
         self.load_softmax = not getattr(args, 'remove_head', False)
 
+        self.output_layer_type = _arg_or_default(args, 'decoder_output_layer', 'shared_embed')
+        self.output_projection = None
+        self.embed_out = None
+
         if self.load_softmax:
             if args.adaptive_softmax_cutoff is not None:
+                if self.output_layer_type != 'shared_embed':
+                    raise ValueError(
+                        '--adaptive-softmax-cutoff replaces the output layer, so it cannot '
+                        'be combined with --decoder-output-layer {}'.format(self.output_layer_type))
                 self.adaptive_softmax = AdaptiveSoftmax(
                     len(dictionary),
                     output_embed_dim,
@@ -285,9 +354,26 @@ class SelfTransformerDecoder(FairseqIncrementalDecoder):
                     factor=args.adaptive_softmax_factor,
                     tie_proj=args.tie_adaptive_proj,
                 )
-            elif not self.share_input_output_embed:
-                self.embed_out = nn.Parameter(torch.Tensor(len(dictionary), output_embed_dim))
-                #nn.init.normal_(self.embed_out, mean=0, std=output_embed_dim ** -0.5)
+            else:
+                if not self.share_input_output_embed:
+                    self.embed_out = nn.Parameter(torch.Tensor(len(dictionary), output_embed_dim))
+                    #nn.init.normal_(self.embed_out, mean=0, std=output_embed_dim ** -0.5)
+                # The head selected by --decoder-output-layer. For 'shared_embed'
+                # this wraps the weights above without owning them, so the state
+                # dict is byte-for-byte what it was before the flag existed.
+                self.output_projection = build_output_layer(
+                    self.output_layer_type, len(dictionary), output_embed_dim,
+                    embed_tokens=embed_tokens, embed_out=self.embed_out,
+                    share_input_output_embed=self.share_input_output_embed,
+                    mlp_hidden_dim=getattr(args, 'decoder_output_mlp_hidden_dim', None),
+                    crf_emission_layer=getattr(args, 'crf_emission_layer', None),
+                    crf_low_rank_dim=getattr(args, 'crf_low_rank_dim', None),
+                    crf_beam_size=getattr(args, 'crf_beam_size', None),
+                    crf_dynamic_transition=not getattr(
+                        args, 'crf_no_dynamic_transition', False),
+                    crf_dynamic_hidden_dim=getattr(args, 'crf_dynamic_hidden_dim', None),
+                    crf_inference=getattr(args, 'crf_inference', None),
+                )
         self.register_buffer('version', torch.Tensor([2]))
         self.normalize = args.decoder_normalize_before and final_norm
         if self.normalize:
@@ -348,14 +434,30 @@ class SelfTransformerDecoder(FairseqIncrementalDecoder):
         if self.project_out_dim is not None:
             x = self.project_out_dim(x)
 
-        if self.adaptive_softmax is None and self.load_softmax:
+        features = x
+        if self.output_projection is not None:
             # project back to size of vocabulary
-            if self.share_input_output_embed:
-                x = F.linear(x, self.embed_tokens.weight)
-            else:
-                x = F.linear(x, self.embed_out)
+            x = self.output_projection(features)
 
-        return x, {'attn': attn, 'inner_states': inner_states, 'predicted_lengths': encoder_out['predicted_lengths']}
+        extra = {
+            'attn': attn,
+            'inner_states': inner_states,
+            'predicted_lengths': encoder_out['predicted_lengths'],
+        }
+        if self.has_structured_output:
+            # A structured head scores whole sequences, so the loss and the
+            # decoding strategies need the features and the head itself, not just
+            # the emission logits above.
+            extra['features'] = features
+            extra['output_layer'] = self.output_projection
+            extra['output_mask'] = ~decoder_padding_mask
+
+        return x, extra
+
+    @property
+    def has_structured_output(self):
+        """Whether the output head scores sequences rather than tokens."""
+        return hasattr(self.output_projection, 'crf_nll')
 
     def max_positions(self):
         """Maximum output length supported by the decoder."""
@@ -698,6 +800,21 @@ def base_architecture(args):
 
     args.decoder_embed_scale = getattr(args, 'decoder_embed_scale', None)
     args.encoder_embed_scale = getattr(args, 'encoder_embed_scale', None)
+
+    # Output ("decoding") layer selection. Defaults reproduce the original
+    # tied-embedding head, so checkpoints predating these flags load unchanged.
+    args.decoder_output_layer = _arg_or_default(args, 'decoder_output_layer', 'shared_embed')
+    args.decoder_output_mlp_hidden_dim = _arg_or_default(
+        args, 'decoder_output_mlp_hidden_dim', args.decoder_output_dim)
+    # CRF hyperparameters; numeric defaults are the ones used in arXiv:1910.11555.
+    args.crf_emission_layer = _arg_or_default(args, 'crf_emission_layer', 'shared_embed')
+    args.crf_low_rank_dim = _arg_or_default(args, 'crf_low_rank_dim', 32)
+    args.crf_beam_size = _arg_or_default(args, 'crf_beam_size', 64)
+    args.crf_no_dynamic_transition = _arg_or_default(args, 'crf_no_dynamic_transition', False)
+    args.crf_dynamic_hidden_dim = _arg_or_default(
+        args, 'crf_dynamic_hidden_dim', args.decoder_output_dim)
+    args.crf_nar_loss_weight = _arg_or_default(args, 'crf_nar_loss_weight', 0.5)
+    args.crf_inference = _arg_or_default(args, 'crf_inference', 'viterbi_marginal')
 
     args.bilm_mask_last_state = getattr(args, 'bilm_mask_last_state', False)
     args.bilm_add_bos = getattr(args, 'bilm_add_bos', False)

@@ -18,6 +18,9 @@ class LabelSmoothedLengthCrossEntropyCriterion(FairseqCriterion):
     def __init__(self, args, task):
         super().__init__(args, task)
         self.eps = args.label_smoothing
+        # lambda of "L = L_CRF + lambda * L_NAR" (arXiv:1910.11555 Eq. 11). It is
+        # declared by the model, which is built before the criterion.
+        self.crf_nar_loss_weight = getattr(args, 'crf_nar_loss_weight', 0.5)
 
     @staticmethod
     def add_args(parser):
@@ -33,7 +36,7 @@ class LabelSmoothedLengthCrossEntropyCriterion(FairseqCriterion):
         3) logging outputs to display while training
         """
         net_output = model(**sample['net_input'])
-        loss, nll_loss, length_loss, ntokens = self.compute_loss(model, net_output, sample, reduce=reduce)
+        loss, nll_loss, length_loss, crf_loss, ntokens = self.compute_loss(model, net_output, sample, reduce=reduce)
         sample_size = ntokens #TODO why not merge ntokens and sample_size? what is the difference?
         logging_output = {
             'loss': utils.item(loss.data) if reduce else loss.data,
@@ -43,6 +46,8 @@ class LabelSmoothedLengthCrossEntropyCriterion(FairseqCriterion):
             'nsentences': sample['target'].size(0),
             'sample_size': sample_size,
         }
+        if crf_loss is not None:
+            logging_output['crf_loss'] = utils.item(crf_loss.data) if reduce else crf_loss.data
         return loss, sample_size, logging_output
 
     def compute_loss(self, model, net_output, sample, reduce=True):
@@ -60,8 +65,28 @@ class LabelSmoothedLengthCrossEntropyCriterion(FairseqCriterion):
             smooth_loss = smooth_loss.sum()
             length_loss = length_loss.sum()
         eps_i = self.eps / lprobs.size(-1)
-        loss = (1. - self.eps) * nll_loss + eps_i * smooth_loss + length_loss
-        return loss, nll_loss, length_loss, non_pad_mask.sum().data.item()
+        nar_loss = (1. - self.eps) * nll_loss + eps_i * smooth_loss
+
+        # A structured output layer scores the target sequence as a whole. When
+        # one is in use its loss leads and the per-token term is demoted to an
+        # auxiliary objective (arXiv:1910.11555 Eq. 11); otherwise nothing here
+        # changes.
+        crf_loss = self.compute_structured_loss(model, net_output, sample, reduce=reduce)
+        if crf_loss is None:
+            loss = nar_loss + length_loss
+        else:
+            loss = crf_loss + self.crf_nar_loss_weight * nar_loss + length_loss
+        return loss, nll_loss, length_loss, crf_loss, non_pad_mask.sum().data.item()
+
+    def compute_structured_loss(self, model, net_output, sample, reduce=True):
+        """Sequence-level loss of a structured output layer, or None."""
+        get_structured_loss = getattr(model, 'get_structured_loss', None)
+        if get_structured_loss is None:
+            return None
+        structured_loss = get_structured_loss(net_output, sample)
+        if structured_loss is None:
+            return None
+        return structured_loss.sum() if reduce else structured_loss
 
     @staticmethod
     def aggregate_logging_outputs(logging_outputs):
@@ -69,7 +94,7 @@ class LabelSmoothedLengthCrossEntropyCriterion(FairseqCriterion):
         ntokens = sum(log.get('ntokens', 0) for log in logging_outputs)
         nsentences = sum(log.get('nsentences', 0) for log in logging_outputs)
         sample_size = sum(log.get('sample_size', 0) for log in logging_outputs)
-        return {
+        aggregated = {
             'loss': sum(log.get('loss', 0) for log in logging_outputs) / sample_size / math.log(2),
             'nll_loss': sum(log.get('nll_loss', 0) for log in logging_outputs) / ntokens / math.log(2),
             'length_loss': sum(log.get('length_loss', 0) for log in logging_outputs) / nsentences / math.log(2),
@@ -77,3 +102,8 @@ class LabelSmoothedLengthCrossEntropyCriterion(FairseqCriterion):
             'nsentences': nsentences,
             'sample_size': sample_size,
         }
+        if any('crf_loss' in log for log in logging_outputs):
+            # A sequence-level loss, so report it per sentence like length_loss.
+            aggregated['crf_loss'] = sum(
+                log.get('crf_loss', 0) for log in logging_outputs) / nsentences / math.log(2)
+        return aggregated

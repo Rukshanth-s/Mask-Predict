@@ -1,0 +1,12 @@
+# Development/test dependencies.
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements-dev.txt
+#   .venv/bin/python -m pytest tests/
+#
+# torch installs the CPU build by default from PyPI; the tests need no GPU.
+torch
+# This fairseq snapshot uses np.float, which numpy removed in 1.24.
+numpy<1.24
+pytest
+tqdm

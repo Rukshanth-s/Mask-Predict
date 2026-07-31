@@ -16,6 +16,21 @@ def duplicate_encoder_out(encoder_out, bsz, beam_size):
 
 
 def generate_step_with_prob(out):
+    """Pick a token per position, with a confidence the strategies can rank.
+
+    Returns ``(tokens, confidence, all_probs)``.
+
+    A structured output layer scores whole sequences, so it decides both the
+    tokens and their confidences itself (see ``--crf-inference``); an
+    unstructured head is just an independent softmax per position. Deciding here
+    keeps every strategy in this package working with either kind of head.
+    """
+    extra = out[1] if len(out) > 1 else None
+    output_layer = extra.get('output_layer') if isinstance(extra, dict) else None
+    features = extra.get('features') if isinstance(extra, dict) else None
+    if output_layer is not None and features is not None and hasattr(output_layer, 'decode'):
+        return output_layer.decode(features, extra.get('output_mask'))
+
     probs = F.softmax(out[0], dim=-1)
     max_probs, idx = probs.max(dim=-1)
     return idx, max_probs, probs
