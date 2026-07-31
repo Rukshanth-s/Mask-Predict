@@ -38,6 +38,9 @@ python train.py ${output_dir}/data-bin --arch bert_transformer_seq2seq --share-a
 vocabulary scores. It is a training-time flag, stored in the checkpoint, so
 generation picks up the same choice automatically.
 
+See [docs/decoding-layers.md](docs/decoding-layers.md) for copy-pasteable
+training and generation commands covering every configuration.
+
 | Option | Flag | What it does |
 | --- | --- | --- |
 | 1 | `--decoder-output-layer shared_embed` | **Default.** A lookup against the (shared) token embedding matrix — the original Mask-Predict head. Adds no parameters, so released checkpoints load unchanged. |
