@@ -113,11 +113,13 @@ ENV/
 fairseq/temporal_convolution_tbc
 
 # data
-data-bin/
+# Leading slashes anchor these to the repo root. Without them, "data/" also
+# matches fairseq/data/ -- i.e. it would ignore core fairseq source.
+/data-bin/
 # raw + tokenised + BPE'd corpora, written by scripts/prepare_data.sh
-data/
+/data/
 # training runs and downloaded checkpoints
-checkpoints/
-ckpt/
+/checkpoints/
+/ckpt/
 *.pt
 token.txt

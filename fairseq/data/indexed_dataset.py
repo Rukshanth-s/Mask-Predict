@@ -87,7 +87,10 @@ dtypes = {
     3: np.int16,
     4: np.int32,
     5: np.int64,
-    6: np.float,
+    # np.float was an alias for Python float, i.e. float64, and numpy 1.24
+    # removed it. np.float64 is that same type, so the dtype codes written to
+    # disk are unchanged, and this works on numpy 1.x and 2.x alike.
+    6: np.float64,
     7: np.double,
     8: np.uint16
 }
@@ -287,7 +290,7 @@ class IndexedDatasetBuilder(object):
         np.int16: 2,
         np.int32: 4,
         np.int64: 8,
-        np.float: 4,
+        np.float64: 4,
         np.double: 8
     }
 
