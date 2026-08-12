@@ -133,8 +133,11 @@ def load_checkpoint(args, trainer):
 
 def load_checkpoint_to_cpu(path, arg_overrides=None):
     """Loads a checkpoint to CPU (with upgrading for backward compatibility)."""
+    # weights_only=False: fairseq checkpoints pickle an argparse.Namespace under
+    # 'args', which torch >= 2.6 refuses to unpickle under its new default.
     state = torch.load(
         path, map_location=lambda s, l: default_restore_location(s, 'cpu'),
+        weights_only=False,
     )
     args = state['args']
     if arg_overrides is not None:

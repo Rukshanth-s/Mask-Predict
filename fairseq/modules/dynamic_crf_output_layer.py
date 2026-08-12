@@ -239,21 +239,28 @@ class DynamicCRFOutputLayer(nn.Module):
         needs no truncation, being a single path.
         """
         emissions, mask = self._prepare(features, mask)
+        return self._gold_score(features, emissions, target, mask)
 
+    def _gold_score(self, features, emissions, target, mask, dynamic=None):
+        """:meth:`gold_score` on emissions the caller has already computed.
+
+        ``dynamic`` optionally supplies pre-computed transition matrices.
+        """
         emitted = emissions.gather(-1, target.unsqueeze(-1)).squeeze(-1)
         score = (emitted * mask).sum(dim=-1)
 
         if target.size(1) > 1:
-            source = self.transition_source(target[:, :-1])
-            successor = self.transition_target(target[:, 1:])
+            source = self.transition_source(target[:, :-1]).float()
+            successor = self.transition_target(target[:, 1:]).float()
             if self.dynamic_transition is None:
                 edges = (source * successor).sum(dim=-1)
             else:
-                dynamic = self._dynamic_matrices(features)
+                if dynamic is None:
+                    dynamic = self._dynamic_matrices(features)
                 edges = torch.einsum('btd,btde,bte->bt', source, dynamic, successor)
             # An edge counts only when both of its endpoints are real tokens.
             edge_mask = mask[:, :-1] & mask[:, 1:]
-            score = score + (edges.float() * edge_mask).sum(dim=-1)
+            score = score + (edges * edge_mask).sum(dim=-1)
 
         return score
 
@@ -264,8 +271,15 @@ class DynamicCRFOutputLayer(nn.Module):
         for training -- see :meth:`crf_nll`.
         """
         emissions, mask = self._prepare(features, mask)
+        return self._log_partition(features, emissions, target, mask)
+
+    def _log_partition(self, features, emissions, target, mask, dynamic=None):
+        """:meth:`log_partition` on emissions the caller has already computed.
+
+        ``dynamic`` optionally supplies pre-computed transition matrices.
+        """
         beam_scores, beam_index = self.build_beam(emissions, target=target, mask=mask)
-        transitions = self.build_transitions(features, beam_index)
+        transitions = self.build_transitions(features, beam_index, dynamic=dynamic)
         return forward_algorithm(beam_scores, transitions, mask)[1]
 
     def crf_nll(self, features, target, mask=None):
@@ -275,8 +289,14 @@ class DynamicCRFOutputLayer(nn.Module):
         the summands of the approximated partition; without that the result could
         be negative and would not be a log-likelihood at all.
         """
-        return (self.log_partition(features, target=target, mask=mask)
-                - self.gold_score(features, target, mask=mask))
+        # The two terms share one emission matrix and one set of transition
+        # matrices. The emission matrix is B x T x V in float32 -- at a 32k
+        # vocabulary the largest tensor in the step -- so computing it once
+        # rather than once per term is what keeps --max-tokens usable.
+        emissions, mask = self._prepare(features, mask)
+        dynamic = None if self.dynamic_transition is None else self._dynamic_matrices(features)
+        return (self._log_partition(features, emissions, target, mask, dynamic)
+                - self._gold_score(features, emissions, target, mask, dynamic))
 
     def decode(self, features, mask=None):
         """Turn the path distribution into tokens with per-position confidences.
@@ -319,26 +339,36 @@ class DynamicCRFOutputLayer(nn.Module):
         return tokens, confidence.masked_fill(~mask, 1.0), emission_probs
 
     def _dynamic_matrices(self, features):
-        """``A^i = f([h_(i-1), h_i])``, one ``d_t x d_t`` matrix per edge."""
+        """``A^i = f([h_(i-1), h_i])``, one ``d_t x d_t`` matrix per edge.
+
+        Float32, like every other score the CRF reasons over. As in
+        :meth:`_prepare` the FFN itself runs in its own dtype and only its output
+        is upcast, so half weights are not mismatched.
+        """
         pair = torch.cat([features[:, :-1], features[:, 1:]], dim=-1)
-        return self.dynamic_transition(pair).view(
+        return self.dynamic_transition(pair).float().view(
             pair.size(0), pair.size(1), self.low_rank_dim, self.low_rank_dim)
 
-    def build_transitions(self, features, beam_index):
+    def build_transitions(self, features, beam_index, dynamic=None):
         """Transition scores restricted to the beam's candidate pairs.
 
         Returns ``B x (T-1) x k x k`` where entry ``[b, i, a, c]`` scores
         candidate ``a`` at position ``i`` followed by candidate ``c`` at ``i+1``.
         Always float32, for the same reason as :meth:`_prepare`.
+
+        ``dynamic`` optionally supplies the ``A^i`` matrices from
+        :meth:`_dynamic_matrices`, so a caller that also needs them elsewhere can
+        compute the FFN once; by default they are computed here.
         """
-        source = self.transition_source(beam_index[:, :-1])   # B x (T-1) x k x d_t
-        target = self.transition_target(beam_index[:, 1:])    # B x (T-1) x k x d_t
+        source = self.transition_source(beam_index[:, :-1]).float()  # B x (T-1) x k x d_t
+        target = self.transition_target(beam_index[:, 1:]).float()   # B x (T-1) x k x d_t
 
         if self.dynamic_transition is None:
             # M = E1 E2^T
             scores = torch.einsum('btad,btcd->btac', source, target)
         else:
             # M^i = E1 A^i E2^T
-            scores = torch.einsum(
-                'btad,btde,btce->btac', source, self._dynamic_matrices(features), target)
-        return scores.float()
+            if dynamic is None:
+                dynamic = self._dynamic_matrices(features)
+            scores = torch.einsum('btad,btde,btce->btac', source, dynamic, target)
+        return scores

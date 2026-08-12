@@ -150,11 +150,15 @@ class Trainer(object):
             # load model parameters
             try:
                 self.get_model().load_state_dict(state['model'], strict=True)
-            except Exception:
+            except Exception as error:
+                # Chain the original: its missing/unexpected key list is the only
+                # thing that says *which* architecture flag disagrees. A CRF
+                # warm-start from a non-structured baseline lands here, and the
+                # fix is scripts/init_crf_from_baseline.py.
                 raise Exception(
-                    'Cannot load model parameters from checkpoint, '
-                    'please ensure that the architectures match.'
-                )
+                    'Cannot load model parameters from checkpoint {}, '
+                    'please ensure that the architectures match:\n{}'.format(filename, error)
+                ) from error
 
             extra_state = state['extra_state']
             self._optim_history = state['optimizer_history']

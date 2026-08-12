@@ -114,4 +114,10 @@ fairseq/temporal_convolution_tbc
 
 # data
 data-bin/
+# raw + tokenised + BPE'd corpora, written by scripts/prepare_data.sh
+data/
+# training runs and downloaded checkpoints
+checkpoints/
+ckpt/
+*.pt
 token.txt

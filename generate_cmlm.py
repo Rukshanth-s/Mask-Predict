@@ -49,7 +49,8 @@ def main(args):
     # Load ensemble
     print('| loading model(s) from {}'.format(args.path))
     models, _ = utils.load_ensemble_for_inference(args.path.split(':'), task, model_arg_overrides=eval(args.model_overrides))
-    models = [model.cuda() for model in models]
+    if use_cuda:
+        models = [model.cuda() for model in models]
 
     # Optimize ensemble for generation
     for model in models:
@@ -87,7 +88,7 @@ def main(args):
 
     with progress_bar.build_progress_bar(args, itr) as t:
 
-        translations = generate_batched_itr(t, strategy, models, tgt_dict, length_beam_size=args.length_beam, use_gold_target_len=args.gold_target_len)
+        translations = generate_batched_itr(t, strategy, models, tgt_dict, length_beam_size=args.length_beam, use_gold_target_len=args.gold_target_len, cuda=use_cuda)
         for sample_id, src_tokens, target_tokens, hypos in translations:
             has_target = target_tokens is not None
             target_tokens = target_tokens.int().cpu() if has_target else None
@@ -105,44 +106,50 @@ def main(args):
                     if args.dehyphenate:
                         target_str = dehyphenate(target_str)
 
+            # --quiet suppresses the per-sentence dump only. Collecting hypotheses
+            # is what BLEU is computed from, so it must happen either way -- doing
+            # it inside the print branch left --quiet scoring an empty list.
             if not args.quiet:
                 print('S-{}\t{}'.format(sample_id, src_str))
-                if has_target:
+
+            if has_target:
+                if not args.quiet:
                     print('T-{}\t{}'.format(sample_id, target_str))
-                    hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
-                        hypo_tokens=hypos.int().cpu(),
-                        src_str=src_str,
-                        alignment= None,
-                        align_dict=align_dict,
-                        tgt_dict=dict,
-                        remove_bpe=args.remove_bpe,
-                    )
-                    if args.dehyphenate:
-                        hypo_str = dehyphenate(hypo_str)
 
-                    if not args.quiet:
-                        print('H-{}\t{}'.format(sample_id, hypo_str))
-                        if args.print_alignment:
-                            print('A-{}\t{}'.format(
-                                sample_id,
-                                ' '.join(map(lambda x: str(utils.item(x)), alignment))
-                            ))
-                        print()
-                        
-                        # Score only the top hypothesis
-                        if has_target:
-                            if align_dict is not None or args.remove_bpe is not None:
-                                # Convert back to tokens for evaluation with unk replacement and/or without BPE
-                                target_tokens = tgt_dict.encode_line(target_str, add_if_not_exist=True)
+                hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
+                    hypo_tokens=hypos.int().cpu(),
+                    src_str=src_str,
+                    alignment= None,
+                    align_dict=align_dict,
+                    tgt_dict=dict,
+                    remove_bpe=args.remove_bpe,
+                )
+                if args.dehyphenate:
+                    hypo_str = dehyphenate(hypo_str)
 
-                            results.append((target_str, hypo_str))
+                if not args.quiet:
+                    print('H-{}\t{}'.format(sample_id, hypo_str))
+                    if args.print_alignment:
+                        print('A-{}\t{}'.format(
+                            sample_id,
+                            ' '.join(map(lambda x: str(utils.item(x)), alignment))
+                        ))
+                    print()
 
-                    num_sentences += 1
+                # Score only the top hypothesis
+                if align_dict is not None or args.remove_bpe is not None:
+                    # Convert back to tokens for evaluation with unk replacement and/or without BPE
+                    target_tokens = tgt_dict.encode_line(target_str, add_if_not_exist=True)
 
-        if has_target:
+                results.append((target_str, hypo_str))
+                num_sentences += 1
+
+        if has_target and results:
             print('Time = {}'.format(timer.elapsed_time))
             ref, out = zip(*results)
             print('| Generate {} with beam={}: BLEU4 = {:2.2f}, '.format(args.gen_subset, args.beam, scorer.score(ref, out)))
+        elif has_target:
+            print('| no hypotheses generated for subset {}'.format(args.gen_subset))
 
 
 def dehyphenate(sent):

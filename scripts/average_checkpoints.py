@@ -11,6 +11,12 @@ import collections
 import torch
 import os
 import re
+import sys
+
+# Unpickling a checkpoint needs `fairseq` importable, but running this as
+# `python scripts/average_checkpoints.py` from the repo root puts scripts/ on
+# sys.path instead of the working directory. Add the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def average_checkpoints(inputs):
@@ -35,6 +41,9 @@ def average_checkpoints(inputs):
             map_location=(
                 lambda s, _: torch.serialization.default_restore_location(s, 'cpu')
             ),
+            # See fairseq/checkpoint_utils.py: 'args' is a pickled Namespace,
+            # which torch >= 2.6 will not unpickle by default.
+            weights_only=False,
         )
         # Copies over the settings from the first checkpoint
         if new_state is None:

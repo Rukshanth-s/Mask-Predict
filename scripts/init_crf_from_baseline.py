@@ -28,9 +28,16 @@ initialised the same way the model would initialise them.
 """
 
 import argparse
+import os
+import sys
 
 import torch
 import torch.nn as nn
+
+# Run as `python scripts/init_crf_from_baseline.py` from the repo root, Python puts
+# scripts/ on sys.path rather than the working directory, so `fairseq` is not
+# importable unless the package happens to be pip-installed. Add the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fairseq.modules.dynamic_crf_output_layer import DynamicCRFOutputLayer
 
