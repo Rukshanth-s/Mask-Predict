@@ -11,6 +11,7 @@ Translate pre-processed data with a trained model.
 import torch
 import numpy as np
 import math
+import time
 import torch.nn.functional as F
 import re
 
@@ -86,9 +87,12 @@ def main(args):
     has_target = True
     timer = TimeMeter()
 
+    # Measures only the model's generate() call -- see generate_batched_itr.
+    gen_stats = {'gen_seconds': 0.0, 'n_sentences': 0, 'n_batches': 0}
+
     with progress_bar.build_progress_bar(args, itr) as t:
 
-        translations = generate_batched_itr(t, strategy, models, tgt_dict, length_beam_size=args.length_beam, use_gold_target_len=args.gold_target_len, cuda=use_cuda)
+        translations = generate_batched_itr(t, strategy, models, tgt_dict, length_beam_size=args.length_beam, use_gold_target_len=args.gold_target_len, cuda=use_cuda, stats=gen_stats)
         for sample_id, src_tokens, target_tokens, hypos in translations:
             has_target = target_tokens is not None
             target_tokens = target_tokens.int().cpu() if has_target else None
@@ -148,6 +152,33 @@ def main(args):
             print('Time = {}'.format(timer.elapsed_time))
             ref, out = zip(*results)
             print('| Generate {} with beam={}: BLEU4 = {:2.2f}, '.format(args.gen_subset, args.beam, scorer.score(ref, out)))
+
+            # Inference cost, measured over generate() alone. Report both because
+            # they answer different questions: throughput matters for offline
+            # translation, per-sentence latency for interactive use. Compare heads
+            # only at identical --max-sentences and --decoding-iterations.
+            gs, ns = gen_stats['gen_seconds'], gen_stats['n_sentences']
+            if ns > 0 and gs > 0:
+                print('| Inference: {:.2f}s for {} sentences in {} batches '
+                      '(batch size {}, {} iterations)'.format(
+                          gs, ns, gen_stats['n_batches'], args.max_sentences,
+                          args.decoding_iterations))
+                print('| Throughput: {:.1f} sentences/s   Latency: {:.2f} ms/sentence '
+                      '({:.1f} ms/batch)'.format(
+                          ns / gs, 1000 * gs / ns, 1000 * gs / gen_stats['n_batches']))
+
+            # Dump hypotheses and references so sacreBLEU, repetition rate and any
+            # other metric can be recomputed later without re-running generation.
+            if args.results_path is not None:
+                import os
+                os.makedirs(os.path.dirname(os.path.abspath(args.results_path)), exist_ok=True)
+                with open(args.results_path + '.hyp', 'w') as fh, \
+                     open(args.results_path + '.ref', 'w') as fr:
+                    for r, o in results:
+                        fr.write(r.replace('\n', ' ') + '\n')
+                        fh.write(o.replace('\n', ' ') + '\n')
+                print('| wrote {}.hyp and {}.ref ({} sentences)'.format(
+                    args.results_path, args.results_path, len(results)))
         elif has_target:
             print('| no hypotheses generated for subset {}'.format(args.gen_subset))
 
@@ -156,12 +187,15 @@ def dehyphenate(sent):
     return re.sub(r'(\S)-(\S)', r'\1 ##AT##-##AT## \2', sent).replace('##AT##', '@')
 
 
-def generate_batched_itr(data_itr, strategy, models, tgt_dict, length_beam_size=None, use_gold_target_len=False, cuda=True):
+def generate_batched_itr(data_itr, strategy, models, tgt_dict, length_beam_size=None, use_gold_target_len=False, cuda=True, stats=None):
     """Iterate over a batched dataset and yield individual translations.
      Args:
         maxlen_a/b: generate sequences of maximum length ax + b,
                 where x is the source sentence length.
             cuda: use GPU for generation
+            stats: optional dict; accumulates 'gen_seconds', 'n_sentences' and
+                'n_batches' measuring ONLY the model's generate() call, so
+                latency numbers exclude data loading and post-processing.
     """
     for sample in data_itr:
         s = utils.move_to_cuda(sample) if cuda else sample
@@ -175,10 +209,22 @@ def generate_batched_itr(data_itr, strategy, models, tgt_dict, length_beam_size=
             k: v for k, v in input.items()
             if k != 'prev_output_tokens'
         }
-        
+
         with torch.no_grad():
             gold_target_len = s['target'].ne(tgt_dict.pad()).sum(-1) if use_gold_target_len else None
+            # CUDA kernels are asynchronous, so synchronise around the timed
+            # region or the measurement is meaningless.
+            if stats is not None:
+                if cuda:
+                    torch.cuda.synchronize()
+                _t0 = time.perf_counter()
             hypos = generate(strategy, encoder_input, models, tgt_dict, length_beam_size, gold_target_len)
+            if stats is not None:
+                if cuda:
+                    torch.cuda.synchronize()
+                stats['gen_seconds'] += time.perf_counter() - _t0
+                stats['n_sentences'] += hypos.size(0)
+                stats['n_batches'] += 1
             for batch in range(hypos.size(0)):
                 src = utils.strip_pad(input['src_tokens'][batch].data, tgt_dict.pad())
                 ref = utils.strip_pad(s['target'][batch].data, tgt_dict.pad()) if s['target'] is not None else None
