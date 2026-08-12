@@ -19,8 +19,14 @@ DATASET="${1:-multi30k}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Some conda envs ship python3 without a `python` alias, so don't hardcode either.
+# Override with PYTHON=/path/to/python if you need a specific interpreter.
+PY="${PYTHON:-$(command -v python3 || command -v python)}"
+[ -n "$PY" ] || { echo "no python3 or python on PATH"; exit 1; }
+echo "using interpreter: $PY ($("$PY" -V 2>&1))"
+
 command -v subword-nmt >/dev/null || { echo "need: pip install subword-nmt"; exit 1; }
-python -c "import sacremoses" 2>/dev/null || { echo "need: pip install sacremoses"; exit 1; }
+"$PY" -c "import sacremoses" 2>/dev/null || { echo "need: pip install sacremoses"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Per-dataset fetch. Each leaves data/$NAME/{train,valid,test}.$SRC/$TGT as
@@ -99,7 +105,7 @@ done
 # predictor, which this model trains jointly with translation. Written to its own
 # filename rather than over train.tok.*, so re-running this script is idempotent
 # and each stage's input stays inspectable.
-python - "$SRC" "$TGT" <<'PY'
+"$PY" - "$SRC" "$TGT" <<'PY'
 import sys
 src, tgt = sys.argv[1], sys.argv[2]
 kept = dropped = 0
@@ -132,7 +138,7 @@ done
 
 cd "$ROOT"
 rm -rf "data-bin/$NAME"
-python preprocess.py \
+"$PY" preprocess.py \
   --source-lang "$SRC" --target-lang "$TGT" \
   --trainpref "data/$NAME/train.bpe" \
   --validpref "data/$NAME/valid.bpe" \
