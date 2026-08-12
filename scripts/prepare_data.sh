@@ -8,11 +8,12 @@
 # comes from live HTTPS sources instead.
 #
 #   bash scripts/prepare_data.sh multi30k     # 29k pairs de-en, 13-word captions
-#   bash scripts/prepare_data.sh iwslt14      # 160k pairs de-en, 19-word TED talks
+#   bash scripts/prepare_iwslt14.sh           # 160k pairs de-en -- SEPARATE script,
+#                                             runs fairseq's own recipe unmodified
 #   bash scripts/prepare_data.sh wmt16-enro   # ~400k pairs en-ro, the paper's benchmark
 #
-# multi30k and iwslt14 are verified end to end. wmt16-enro is NOT: its URLs were
-# checked but the 241 MB download and the SGML extraction have never been run.
+# multi30k is verified end to end. wmt16-enro is NOT: its URLs were checked but the
+# 241 MB download and the SGML extraction have never been run.
 #
 # Output: data-bin/<name>/ ready for train.py, plus data/<name>/ with the text.
 #
@@ -51,78 +52,6 @@ fetch_multi30k() {
   popd >/dev/null
 }
 
-fetch_iwslt14() {
-  # IWSLT14 de-en: ~160k pairs of TED talk transcripts, ~20 words/sentence.
-  # Five times Multi30k and much longer sentences, which is what the CRF needs to
-  # have anything to fix -- but only 19 MB, versus 241 MB for WMT16.
-  #
-  # The original source (wit3.fbk.eu) now redirects to a Google login, so the
-  # tarball comes from this repo's own history: it is committed on the
-  # freeze_layer branch at data/iwslt14.tokenized.de-en/de-en.tgz.
-  NAME=iwslt14.de-en; SRC=de; TGT=en; BPE_MERGES=10000
-  local tgz=data/$NAME/de-en.tgz
-  mkdir -p "data/$NAME"
-
-  if [ ! -f "$tgz" ]; then
-    echo "fetching de-en.tgz from git history (branch freeze_layer)..."
-    git archive origin/freeze_layer data/iwslt14.tokenized.de-en/de-en.tgz 2>/dev/null \
-      | tar -xO > "$tgz" || {
-        rm -f "$tgz"
-        cat <<'MSG'
-Could not read de-en.tgz from origin/freeze_layer.
-
-If you cloned with --single-branch, that branch is not present. Fetch it (~33 MB):
-
-    git remote set-branches origin '*'
-    git fetch --all
-
-then re-run this script.
-MSG
-        exit 1; }
-  fi
-  [ -s "$tgz" ] || { echo "de-en.tgz is empty"; exit 1; }
-
-  pushd "data/$NAME" >/dev/null
-  [ -d de-en ] || tar -xzf de-en.tgz
-
-  # Training text: drop the three metadata line types and untag title/description.
-  # This is exactly fairseq's prepare-iwslt14.sh recipe. Verified on this tarball:
-  # 178526 raw lines in both languages -> 174443 in both, i.e. 3 x 1361 talks
-  # removed, so the two sides stay aligned. <speaker>/<doc>/<reviewer> do not
-  # occur in this distribution, so do not filter for them.
-  for lang in de en; do
-    [ -f "train.raw.$lang" ] && continue
-    grep -v '<url>' "de-en/train.tags.de-en.$lang" \
-      | grep -v '<talkid>' | grep -v '<keywords>' \
-      | sed -e 's/<title>//g' -e 's#</title>##g' \
-            -e 's/<description>//g' -e 's#</description>##g' \
-            -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
-      > "train.raw.$lang"
-  done
-
-  # Dev/test come as SGML: keep the <seg> contents.
-  desgml_seg() {
-    grep '<seg id' "$1" \
-      | sed -e 's#<seg id="[0-9]*">[[:space:]]*##g' -e 's#[[:space:]]*</seg>##g' \
-            -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
-  }
-  # The canonical IWSLT14 de-en setup: test is the concatenation of dev2010,
-  # tst2010, tst2011, tst2012 AND TEDX.dev2012 -- 887+1565+1433+1700+1165 = 6750,
-  # which is the published test-set size. Omitting TEDX gives 5585 and would not
-  # be comparable to the literature. valid = every 23rd training line held out.
-  for lang in de en; do
-    : > "test.$lang"
-    for s in TED.dev2010 TED.tst2010 TED.tst2011 TED.tst2012 TEDX.dev2012; do
-      desgml_seg "de-en/IWSLT14.$s.de-en.$lang.xml" >> "test.$lang"
-    done
-    awk 'NR % 23 == 0'  "train.raw.$lang" > "valid.$lang"
-    awk 'NR % 23 != 0'  "train.raw.$lang" > "train.$lang"
-  done
-  popd >/dev/null
-
-  echo "IWSLT14 de-en split: train $(wc -l < data/$NAME/train.de), valid $(wc -l < data/$NAME/valid.de), test $(wc -l < data/$NAME/test.de) (test should be 6750)"
-}
-
 fetch_wmt16_enro() {
   NAME=wmt16.en-ro; SRC=en; TGT=ro; BPE_MERGES=40000
   local dl=https://data.statmt.org/wmt16/translation-task
@@ -159,7 +88,7 @@ fetch_wmt16_enro() {
 
 case "$DATASET" in
   multi30k)    fetch_multi30k ;;
-  iwslt14)     fetch_iwslt14 ;;
+  iwslt14)     echo "For IWSLT14 use: bash scripts/prepare_iwslt14.sh"; echo "(it runs fairseq's own prepare-iwslt14.sh unmodified)"; exit 1 ;;
   wmt16-enro)  fetch_wmt16_enro ;;
   *) echo "unknown dataset '$DATASET' (multi30k | iwslt14 | wmt16-enro)"; exit 1 ;;
 esac
