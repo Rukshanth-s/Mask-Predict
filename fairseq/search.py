@@ -80,7 +80,10 @@ class BeamSearch(Search):
             ),
             out=(self.scores_buf, self.indices_buf),
         )
-        torch.div(self.indices_buf, vocab_size, out=self.beams_buf)
+        # Flat topk indices split into (beam, token): torch.div is true division
+        # on integers since torch 1.5, so the rounding mode must be explicit or
+        # the float result cannot be written to the long buffer.
+        torch.div(self.indices_buf, vocab_size, rounding_mode='floor', out=self.beams_buf)
         self.indices_buf.fmod_(vocab_size)
         return self.scores_buf, self.indices_buf, self.beams_buf
 

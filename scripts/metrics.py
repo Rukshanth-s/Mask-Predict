@@ -133,8 +133,11 @@ def main():
             'sb_none': None, 'sb_13a': None,
         }
         if sacrebleu is not None and not args.no_sacrebleu:
-            none = sacrebleu.BLEU(tokenize='none')
-            a13 = sacrebleu.BLEU(tokenize='13a')
+            # force=True suppresses "you forgot to detokenize" -- our text IS
+            # tokenised on purpose (official IWSLT14 recipe), which is exactly why
+            # tokenize='none' is the correct variant to report.
+            none = sacrebleu.BLEU(tokenize='none', force=True)
+            a13 = sacrebleu.BLEU(tokenize='13a', force=True)
             r_none = none.corpus_score(hyps, [refs])
             r_13a = a13.corpus_score(hyps, [refs])
             row['sb_none'], row['sb_13a'] = r_none.score, r_13a.score
@@ -143,7 +146,7 @@ def main():
 
     print('=' * 104)
     print('{:<16} {:>6} {:>9} {:>10} {:>9} {:>7} {:>7} {:>8} {:>9}'.format(
-        'run', 'sents', 'tok BLEU', 'sacreBLEU', 'sacre13a', 'rep-1', 'rep-4', 'sent-rep', 'len ratio'))
+        'run', 'sents', 'tok BLEU', 'sacre:none', '(13a)*', 'rep-1', 'rep-4', 'sent-rep', 'len ratio'))
     print('-' * 104)
     for r in rows:
         print('{:<16} {:>6} {:>9.2f} {:>10} {:>9} {:>6.2f}% {:>6.2f}% {:>7.1f}% {:>9.3f}'.format(
@@ -156,7 +159,14 @@ def main():
     print('{:<16} {:>6} {:>9} {:>10} {:>9} {:>6.2f}% {:>6.2f}% {:>7} {:>9.3f}'.format(
         'HUMAN (refs)', r0['n'], '-', '-', '-', r0['rep1_ref'], r0['rep4_ref'], '-', 1.000))
     print('=' * 104)
-    print('rep-1 / rep-4: lower is better, but the HUMAN row is the floor, not 0.')
+    print('REPORT tok BLEU (== sacre:none). The (13a)* column re-tokenises text that')
+    print('is already tokenised, so it is inflated and NOT comparable to published')
+    print('numbers -- shown only to make that explicit.')
+    print()
+    print('rep-1: closer to the HUMAN row is better, not closer to zero. A model well')
+    print('BELOW the human rate is producing unnaturally repetition-free (degenerate)')
+    print('text, which is not a win. Same for rep-4.')
+    print()
     print('Compare inference latency from generate_cmlm.py output, at identical')
     print('--max-sentences and --decoding-iterations.')
     if sigs:

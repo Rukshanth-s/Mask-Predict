@@ -9,6 +9,8 @@
 Translate pre-processed data with a trained model.
 """
 
+import time
+
 import torch
 
 from fairseq import bleu, checkpoint_utils, options, progress_bar, tasks, utils
@@ -91,6 +93,12 @@ def main(args):
         scorer = bleu.Scorer(tgt_dict.pad(), tgt_dict.eos(), tgt_dict.unk())
     num_sentences = 0
     has_target = True
+    # Inference cost, accumulated over inference_step alone. Kept separate from
+    # gen_timer because that is a StopwatchMeter: bare time.time() with no CUDA
+    # synchronisation, so its sentences/s under-reports work still queued on the
+    # device. These three carry the same semantics as generate_cmlm.py's stats
+    # dict, which is what makes an AR number comparable to a Mask-Predict one.
+    gen_seconds, timed_sentences, n_batches = 0.0, 0, 0
     with progress_bar.build_progress_bar(args, itr) as t:
         wps_meter = TimeMeter()
         for sample in t:
@@ -102,10 +110,20 @@ def main(args):
             if args.prefix_size > 0:
                 prefix_tokens = sample['target'][:, :args.prefix_size]
 
+            # CUDA kernels are asynchronous, so synchronise around the timed
+            # region or the measurement is meaningless.
+            if use_cuda:
+                torch.cuda.synchronize()
+            _t0 = time.perf_counter()
             gen_timer.start()
             hypos = task.inference_step(generator, models, sample, prefix_tokens)
             num_generated_tokens = sum(len(h[0]['tokens']) for h in hypos)
             gen_timer.stop(num_generated_tokens)
+            if use_cuda:
+                torch.cuda.synchronize()
+            gen_seconds += time.perf_counter() - _t0
+            timed_sentences += len(hypos)
+            n_batches += 1
 
             for i, sample_id in enumerate(sample['id'].tolist()):
                 has_target = sample['target'] is not None
@@ -177,6 +195,20 @@ def main(args):
 
     print('| Translated {} sentences ({} tokens) in {:.1f}s ({:.2f} sentences/s, {:.2f} tokens/s)'.format(
         num_sentences, gen_timer.n, gen_timer.sum, num_sentences / gen_timer.sum, 1. / gen_timer.avg))
+
+    # Report both: throughput matters for offline translation, per-sentence latency
+    # for interactive use. Compare against Mask-Predict only at identical
+    # --max-sentences, and quote the beam -- greedy is autoregressive decoding's
+    # own fast mode and is the honest opponent for a speed claim.
+    if timed_sentences > 0 and gen_seconds > 0:
+        print('| Inference: {:.2f}s for {} sentences in {} batches '
+              '(batch size {}, beam {})'.format(
+                  gen_seconds, timed_sentences, n_batches, args.max_sentences, args.beam))
+        print('| Throughput: {:.1f} sentences/s   Latency: {:.2f} ms/sentence '
+              '({:.1f} ms/batch)'.format(
+                  timed_sentences / gen_seconds, 1000 * gen_seconds / timed_sentences,
+                  1000 * gen_seconds / n_batches))
+
     if has_target:
         print('| Generate {} with beam={}: {}'.format(args.gen_subset, args.beam, scorer.result_string()))
     return scorer
